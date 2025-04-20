@@ -1,151 +1,137 @@
-const SPREADSHEET_ID = "スプレッドシートのID";
-const MAIL_ADDRESS = "example@example.com";
-const FOLDER_ID="写真保存用フォルダのID"
+// 基本定数 
+const SPREADSHEET_ID = 'MY_SPRED_SHEET_ID'; // スプレッドシート ID
+const IMAGE_FOLDER   = 'DRIVE_FOLDER_ID';                          // 画像保存フォルダ ID
+const MAIL_TO        = 'teacher@example.com';                           // 通知先メールアドレス
 
-// エントリーポイント：URL パラメータ admin=true に応じて画面を切り替え
-function doGet(e) {
-  if (e.parameter.admin === "true") {
-    return HtmlService.createTemplateFromFile('Admin').evaluate().setTitle("管理者用予約状況");
-  } else {
-    return HtmlService.createTemplateFromFile('Index').evaluate().setTitle("質問予約フォーム");
-  }
+const SLOT_SHEET = '予約枠';   // B:時間  C:上限  D:予約人数  E:TRUE/FALSE
+const LOG_SHEET  = '質問ログ'; // 予約情報を追加するシート名
+
+//  画面切り替え 
+function doGet(e){
+  // ?admin=true なら管理者画面、それ以外は予約フォーム
+  return (e.parameter.admin === 'true')
+    ? HtmlService.createTemplateFromFile('Admin').evaluate().setTitle('管理者用予約状況')
+    : HtmlService.createTemplateFromFile('Index').evaluate().setTitle('質問予約フォーム');
 }
 
-// 予約情報を「質問ログ」シートに登録し、
-// 「予約枠」シートの対象時間の予約人数（D列）を更新し、メール通知する
-function submitReservation(reservationData) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000); // 同時アクセス対策：最大30秒待機
-  try {
-    var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    var logSheet = ss.getSheetByName("質問ログ");
+// 送信直前の「空き確認」
+function isSlotAvailable(timeSlot){
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SLOT_SHEET);
+  const data  = sheet.getRange(2,2,sheet.getLastRow()-1,4).getDisplayValues(); // B~E
+  for (let r of data){
+    if (r[0] === timeSlot) return r[3] === 'TRUE'; // E列 TRUE/FALSE
+  }
+  return false; // 見つからなければ不可
+}
 
-    // もし予約時に写真がアップロードされていれば、フォルダへ保存しファイルIDを取得
-    if (reservationData.imageData) {
-      var imageFileId = saveUploadedImage(
-                            reservationData.imageData,
-                            reservationData.timeSlot + "_" + reservationData.studentNumber + ".jpg"
-                         );
-      reservationData.imageFileId = imageFileId;
+// 予約枠リストを返す 
+function getSlotList(){
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SLOT_SHEET);
+  const data  = sheet.getRange(2,2,sheet.getLastRow()-1,4).getDisplayValues();
+  return data.map(r => ({ time:r[0], available:r[3]==='TRUE' }));
+}
+
+// 予約受付メイン 
+function submitReservation(data){
+  const lock = LockService.getScriptLock();       // スクリプト全体で共有ロック
+  try{
+    lock.waitLock(30000);                        // 最大 30 秒待機（取れないと例外）
+
+    // ① ロック下で空き再確認 & 予約人数 D列を +1
+    const slotInfo = reserveSlot(data.timeSlot);  // {row,newCount}
+
+    // ② 画像を Drive に保存（複数）
+    const fileIds = [];
+    if (Array.isArray(data.imageData)){
+      data.imageData.forEach((b64,i)=>{
+        const id = saveImage(b64,
+          `${data.timeSlot}_${data.studentNumber}_${i+1}.jpg`);
+        fileIds.push(id);
+      });
     }
-    
-    // 「質問ログ」シートに予約情報を追加
-    logSheet.appendRow([
-      reservationData.timeSlot,
-      reservationData.grade,
-      reservationData.class,
-      reservationData.studentNumber,
-      reservationData.subject,
-      reservationData.textbook,
-      reservationData.page,
-      reservationData.question,
-      (reservationData.imageFileId ? reservationData.imageFileId : ""),
-      new Date(),
-      "予約済み"
-    ]);
-    
-    // 「予約枠」シートの対象の時間帯の予約人数（D列）を +1 する
-    updateReservationSlot(reservationData.timeSlot);
-    
-    // 予約完了後にメール通知を行う（画像がある場合は公開URLを添付）
-    sendNotification(reservationData);
-    
-    return { result: "success" };
-  } catch (err) {
-    return { result: "error", message: err.message };
-  } finally {
-    lock.releaseLock();
+
+    // ③ 質問ログシートに記録
+    SpreadsheetApp.openById(SPREADSHEET_ID)
+      .getSheetByName(LOG_SHEET)
+      .appendRow([
+        data.timeSlot,
+        data.grade,
+        data.class,
+        data.studentNumber,
+        data.subject,
+        data.textbook,
+        data.page,
+        data.question,
+        fileIds.join(','),
+        new Date(),
+        '予約済み'
+      ]);
+
+    // ④ メール通知
+    sendMail(data, fileIds, slotInfo.newCount);
+
+    return {result:'success'};
+
+  }catch(err){
+    // 送信者側へエラーメッセージを返す
+    return {result:'error', message: err.message};
+  }finally{
+    lock.releaseLock();           // 必ずロックを解放
   }
 }
 
-// 指定された時間帯（例："15:40"）の「予約枠」シートにおいて、予約人数（D列）を+1する処理
-// ※ E列（予約可否）はスプレッドシート側の関数で管理するため、こちらでは変更しない
-function updateReservationSlot(timeSlot) {
-  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  var slotSheet = ss.getSheetByName("予約枠");
-  
-  var lastRow = slotSheet.getLastRow();
-  if (lastRow < 2) throw new Error("予約枠シートにデータがありません");
-  
-  // B列（予約可能時間）の値（2行目以降）を取得
-  var timeValues = slotSheet.getRange(2, 2, lastRow - 1, 1).getDisplayValues();
-  var targetRow = null;
-  for (var i = 0; i < timeValues.length; i++) {
-    if (timeValues[i][0] === timeSlot) {
-      targetRow = i + 2; // 実際のシート行番号（ヘッダーが1行目なので2行目以降）
-      break;
+// =予約枠シートで D列を +1 
+function reserveSlot(time){
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SLOT_SHEET);
+  const data  = sheet.getRange(2,2,sheet.getLastRow()-1,4).getDisplayValues(); // B~E
+
+  for (let i=0;i<data.length;i++){
+    if (data[i][0] === time){
+      if (data[i][3] !== 'TRUE')               // E列が FALSE → 満席
+        throw new Error('その枠は満席になりました。別の時間を選んでください');
+
+      const row = i + 2;                       // 実際のシート行（1 行目はヘッダー）
+      const cell = sheet.getRange(row, 4);     // D列: 予約人数
+      const newCount = cell.getValue() + 1;    // インクリメント
+      cell.setValue(newCount);
+      // E列 (TRUE/FALSE) はシート側の関数で自動更新される
+      return {row, newCount};
     }
   }
-  
-  if (!targetRow) throw new Error("指定した予約時間 '" + timeSlot + "' の行が見つかりません");
-  
-  // D列（予約人数）の取得・更新
-  var currentCountCell = slotSheet.getRange(targetRow, 4);
-  var currentCount = currentCountCell.getValue();
-  currentCount++;
-  currentCountCell.setValue(currentCount);
+  throw new Error('指定した予約枠が見つかりません');
 }
 
-// 予約枠シートから、各行のB列（予約可能時間）とE列（予約可否）を取得してオブジェクト配列として返す
-// 例: [{ time: "15:40", available: true }, ...]
-function getSlotList() {
-  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  var slotSheet = ss.getSheetByName("予約枠");
-  if (!slotSheet) throw new Error("予約枠シートが見つかりません");
-  
-  var lastRow = slotSheet.getLastRow();
-  if (lastRow < 2) return [];
-  
-  // 2行目以降のB～E列を取得（B: 時間, E: 予約可否）
-  var data = slotSheet.getRange(2, 2, lastRow - 1, 4).getDisplayValues();
-  var slots = [];
-  for (var i = 0; i < data.length; i++) {
-    slots.push({ time: data[i][0], available: (data[i][3] === "TRUE") });
-  }
-  return slots;
-}
-
-// 写真（Base64 エンコードされた画像データ）を指定フォルダに保存し、保存したファイルのIDを返す
-// 保存後はファイルの共有設定を「リンクを知っている全員が閲覧可能」に変更する
-function saveUploadedImage(base64Data, fileName) {
-  var matches = base64Data.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-  if (!matches || matches.length < 3) {
-    throw new Error("無効な画像データです");
-  }
-  var contentType = matches[1];
-  var data = Utilities.base64Decode(matches[2]);
-  var blob = Utilities.newBlob(data, contentType, fileName);
-  
-  var folderId = FOLDER_ID;  // 
-  var folder = DriveApp.getFolderById(folderId);
-  var file = folder.createFile(blob);
-  // ファイルの共有設定を「リンクを知っている全員が閲覧可能」にする
+// Drive に画像保存（リンク公開）
+function saveImage(base64,fileName){
+  const m = base64.match(/^data:(.+?);base64,(.+)$/);
+  if (!m) throw new Error('画像の解析に失敗しました');
+  const blob = Utilities.newBlob(Utilities.base64Decode(m[2]), m[1], fileName);
+  const file = DriveApp.getFolderById(IMAGE_FOLDER).createFile(blob);
   file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-  
   return file.getId();
 }
 
-// 予約が完了した際に、メールで通知する機能
-// 画像がある場合は、Googleドライブ上の公開URLをメール本文に含める
-function sendNotification(reservationData) {
-  // 送信先のメールアドレス（必要に応じて変更してください）
-  var teacherEmail = MAIL_ADDRESS;
-  
-  // メールの件名・本文の組み立て
-  var subject = "新規予約: " + reservationData.timeSlot;
-  var body = "新しい予約が入りました。\n\n" +
-             "【予約枠】 " + reservationData.timeSlot + "\n" +
-             "【学年】 " + reservationData.grade + "\n" +
-             "【組・番号】 " + reservationData.class + " - " + reservationData.studentNumber + "\n" +
-             "【科目】 " + reservationData.subject + "\n" +
-             "【教材・ページ】 " + reservationData.textbook + " / " + reservationData.page + "\n" +
-             "【質問内容】\n" + reservationData.question + "\n";
-  if (reservationData.imageFileId) {
-    // 画像の公開URLを生成
-    var imageUrl = "https://drive.google.com/file/d/" + reservationData.imageFileId + "/view?usp=sharing";
-    body += "\n【画像】\n" + imageUrl + "\n";
+// メール通知 
+function sendMail(info, fileIds, newCount){
+  let body =
+`新しい予約が入りました
+
+【予約枠】 ${info.timeSlot}
+【現在の予約人数】 ${newCount}
+
+【学年】 ${info.grade}
+【組・番号】 ${info.class}-${info.studentNumber}
+【科目】 ${info.subject}
+【教材・ページ】 ${info.textbook} / ${info.page}
+
+【質問内容】
+${info.question}
+`;
+  if (fileIds.length){
+    body += '\n【画像リンク】\n';
+    fileIds.forEach(id=>{
+      body += 'https://drive.google.com/file/d/' + id + '/view?usp=sharing\n';
+    });
   }
-  
-  // メール送信（メール本文はプレーンテキスト）
-  MailApp.sendEmail(teacherEmail, subject, body);
+  MailApp.sendEmail(MAIL_TO, '新規予約: ' + info.timeSlot, body);
 }

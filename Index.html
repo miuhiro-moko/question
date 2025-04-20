@@ -1,137 +1,146 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <base target="_top">
-    <meta charset="UTF-8">
-    <title>質問予約フォーム</title>
-    <style>
-      body { font-family: sans-serif; }
-      .slot {
-        display: inline-block;
-        margin: 5px;
-        padding: 10px;
-        border: 1px solid #ccc;
-        cursor: pointer;
-      }
-      .slot.selected { background-color: #def; }
-      .slot.reserved { background-color: #ccc; cursor: default; }
-    </style>
-  </head>
-  <body>
-    <h1>質問予約フォーム</h1>
-    
-    <!-- 予約枠一覧（予約枠シートの内容に基づく） -->
-    <div id="slots"></div>
-    
-    <!-- 予約フォーム -->
-    <form id="reservationForm">
-      <input type="hidden" name="timeSlot" id="timeSlot" value="">
-      <div><label>学年: <input type="text" name="grade" required></label></div>
-      <div><label>組: <input type="text" name="class" required></label></div>
-      <div><label>番号: <input type="text" name="studentNumber" required></label></div>
-      <div><label>科目: <input type="text" name="subject" required></label></div>
-      <div><label>教材: <input type="text" name="textbook" required></label></div>
-      <div><label>ページ: <input type="text" name="page" required></label></div>
-      <div>
-        <label>質問内容:<br>
-          <textarea name="question" required></textarea>
-        </label>
-      </div>
-      <div>
-        <label>質問内容の写真: <input type="file" id="imageInput"></label>
-      </div>
-      <div>
-        <button type="submit">予約する</button>
-      </div>
-    </form>
-    
-    <script>
-      // グローバル変数：サーバー側から取得した予約枠リストを格納
-      let slotList = [];
-      
-      // サーバー側の getSlotList() を呼び出して予約枠リストを取得
-      function fetchSlotList(callback) {
-        google.script.run.withSuccessHandler(function(data) {
-          slotList = data; // data: 例 [{ time: "15:40", available: true }, ... ]
-          if (callback) callback();
-        }).getSlotList();
-      }
-      
-      // 取得した slotList をもとに、予約枠のボタンを表示する
-      function displaySlots() {
-        const slotsDiv = document.getElementById('slots');
-        slotsDiv.innerHTML = "";
-        slotList.forEach(function(slotObj) {
-          const div = document.createElement('div');
-          div.className = 'slot';
-          div.textContent = slotObj.time;
-          
-          if (!slotObj.available) {
-            // 予約不可の場合は reserved クラスを追加しクリック無効
-            div.classList.add('reserved');
-          } else {
-            // 予約可能の場合はクリック処理を設定
-            div.onclick = function() {
-              // 選択状態の解除と設定
-              document.querySelectorAll('.slot').forEach(function(el) {
-                el.classList.remove('selected');
-              });
-              div.classList.add('selected');
-              document.getElementById('timeSlot').value = slotObj.time;
-            };
-          }
-          slotsDiv.appendChild(div);
-        });
-      }
-      
-      // 初期化：予約枠リスト取得後、表示
-      function init() {
-        fetchSlotList(displaySlots);
-      }
-      
-      window.onload = init;
-      
-      // 予約フォーム送信処理
-      document.getElementById('reservationForm').addEventListener('submit', function(e) {
-        e.preventDefault();
-        const formData = new FormData(this);
-        const reservationData = {
-          timeSlot: formData.get('timeSlot'),
-          grade: formData.get('grade'),
-          class: formData.get('class'),
-          studentNumber: formData.get('studentNumber'),
-          subject: formData.get('subject'),
-          textbook: formData.get('textbook'),
-          page: formData.get('page'),
-          question: formData.get('question'),
-          imageData: ""
+<head>
+  <meta charset="UTF-8">
+  <title>質問予約フォーム</title>
+  <style>
+    body{font-family:sans-serif;margin:20px;}
+    #slots{margin-bottom:15px;}
+    .slot{
+      display:inline-block;margin:4px;padding:8px 14px;
+      border:1px solid #888;border-radius:4px;cursor:pointer;
+      user-select:none;
+    }
+    .slot.selected {background:#d0e6ff;}
+    .slot.reserved {background:#ccc;color:#666;cursor:default;}
+  </style>
+</head>
+<body>
+<h1>質問予約フォーム</h1>
+
+<!-- 予約枠ボタン-->
+<div id="slots">読み込み中…</div>
+
+<!-- 入力フォーム -->
+<form id="reservationForm">
+  <input type="hidden" name="timeSlot" id="timeSlot">
+
+  <label>学年 <input name="grade"  required></label><br>
+  <label>組   <input name="class"  required></label><br>
+  <label>番号 <input name="studentNumber"  required></label><br>
+  <label>科目 <input name="subject" required></label><br>
+  <label>教材 <input name="textbook" required></label><br>
+  <label>ページ<input name="page"     required></label><br>
+  <label>質問内容<br>
+    <textarea name="question" rows="4" required></textarea>
+  </label><br>
+  <label>写真を選択（複数可）
+    <input type="file" id="imageInput" multiple accept="image/*">
+  </label><br><br>
+
+  <button type="submit">予約する</button>
+</form>
+
+<script>
+  // 取得したスロット情報を保持する配列
+  let slotList = [];               // [{time:'15:40', available:true}, …]
+
+  // サーバーからスロット一覧を取得して slotList に格納
+  function loadSlots(){
+    google.script.run.withSuccessHandler(function(data){
+      slotList = data;
+      renderSlots();
+    }).getSlotList();
+  }
+
+  // 画面に予約枠ボタンを描画
+  function renderSlots(){
+    const box = document.getElementById('slots');
+    box.innerHTML = '';
+    slotList.forEach(obj=>{
+      const d = document.createElement('div');
+      d.className = 'slot';
+      d.textContent = obj.time;
+
+      if(!obj.available){
+        // 満席の場合は灰色にしてクリック禁止
+        d.classList.add('reserved');
+      }else{
+        // 選択処理
+        d.onclick = ()=>{
+          document.querySelectorAll('.slot').forEach(el=>el.classList.remove('selected'));
+          d.classList.add('selected');
+          document.getElementById('timeSlot').value = obj.time;
         };
-        
-        const fileInput = document.getElementById('imageInput');
-        if (fileInput.files.length > 0) {
-          const reader = new FileReader();
-          reader.onload = function(evt) {
-            reservationData.imageData = evt.target.result;
-            submitReservationData(reservationData);
-          };
-          reader.readAsDataURL(fileInput.files[0]);
-        } else {
-          submitReservationData(reservationData);
-        }
-      });
-      
-      // サーバー側の submitReservation() を呼び出して予約を実行
-      function submitReservationData(data) {
-        google.script.run.withSuccessHandler(function(resp) {
-          if (resp.result === "success") {
-            alert("予約が完了しました!ページを閉じて大丈夫です！");
-            // 予約後は最新の予約枠情報を再取得して表示更新
-            fetchSlotList(displaySlots);
-          } else {
-            alert("エラー: " + resp.message);
-          }
-        }).submitReservation(data);
       }
-    </script>
-  </body>
+      box.appendChild(d);
+    });
+  }
+
+  // フォーム送信イベント
+  document.getElementById('reservationForm').addEventListener('submit', e=>{
+    e.preventDefault();
+
+    const timeSlot = document.getElementById('timeSlot').value;
+    if(!timeSlot){
+      alert('予約枠を選択してください');
+      return;
+    }
+
+    // ① 送信直前にサーバーへ再確認
+    google.script.run.withSuccessHandler(function(ok){
+      if(!ok){
+        alert('その枠は満席になりました。別の時間を選んでください');
+        loadSlots();                // 最新状態を取得し直す
+        return;
+      }
+      // ② まだ空いていれば画像を Base64 に変換して送信
+      convertFilesAndSubmit();
+    }).isSlotAvailable(timeSlot);
+  });
+
+  // FileReader で複数ファイルを Base64 へ変換し submitReservation へ
+  function convertFilesAndSubmit(){
+    const fInput = document.getElementById('imageInput');
+    const files  = [...fInput.files];               // FileList → 配列
+
+    // 単一ファイルを Promise で Base64 に変換
+    const toB64 = file => new Promise(res=>{
+      const r = new FileReader();
+      r.onload = () => res(r.result);
+      r.readAsDataURL(file);
+    });
+
+    // すべてのファイルを変換してから送信
+    Promise.all(files.map(toB64)).then(b64list=>{
+      const fd = new FormData(document.getElementById('reservationForm'));
+      const payload = {
+        timeSlot:      fd.get('timeSlot'),
+        grade:         fd.get('grade'),
+        class:         fd.get('class'),
+        studentNumber: fd.get('studentNumber'),
+        subject:       fd.get('subject'),
+        textbook:      fd.get('textbook'),
+        page:          fd.get('page'),
+        question:      fd.get('question'),
+        imageData:     b64list          // Base64 配列
+      };
+
+      // 予約登録
+      google.script.run.withSuccessHandler(function(resp){
+        if(resp.result === 'success'){
+          alert('予約が完了しました');
+          document.getElementById('reservationForm').reset();
+          loadSlots();                 // 残枠を再取得
+        }else{
+          alert('エラー: ' + resp.message);
+        }
+      }).submitReservation(payload);
+    });
+  }
+
+  // ページ読み込み時にスロットを取得
+  window.onload = loadSlots;
+</script>
+</body>
 </html>
